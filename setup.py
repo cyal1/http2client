@@ -8,7 +8,7 @@ with open("README.md", "r", encoding='utf-8') as fh:
 
 setup(
     name="http2client",
-    version="0.0.6",
+    version="0.0.8",
     author="cyal1",
     author_email="dsq6115119@gmail.com",
     description="A simple HTTP/2 client for Cyber Security",

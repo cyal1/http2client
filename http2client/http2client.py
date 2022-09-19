@@ -20,8 +20,12 @@ from h2.events import (
 
 
 class HttpStruct:
-    _headers: list[tuple[str, str]] = None
+    _stream_id: int
+    _headers: list = None
     _data: bytes = b''
+
+    def __init__(self, stream_id: int):
+        self._stream_id = stream_id
 
     def getHeaders(self):
         return self._headers
@@ -29,14 +33,28 @@ class HttpStruct:
     def getData(self):
         return self._data
 
-    def setHeaders(self, headers):
-        self._headers = headers
+    def getStreamId(self):
+        return self._stream_id
 
-    def setData(self, data):
+    def _setData(self, data):
         self._data = data
 
+    def _setHeaders(self, headers):
+        self._headers = headers
+
     def __str__(self) -> str:
-        return f"<HttpStruct>{dict({'headers': self._headers, 'data': self._data})}"
+        return f"<HttpStruct>{dict({'stream_id': str(self._stream_id), 'headers': self._headers, 'data': self._data})}"
+
+    def raw_resp(self) -> bytes:
+        return b"\r\n".join([b': '.join(header) for header in self.getHeaders()]) + b"\r\n" + self.getData()
+
+    def getStatusCode(self):
+        if not self.getHeaders():
+            return None
+        return self.getHeaders()[0][1].decode()
+
+    def getContentLength(self) -> int:
+        return len(self.getData())
 
 
 def establish_tcp_connection(host, port, timeout=15):
@@ -113,20 +131,20 @@ def negotiate_tls(tcp_conn, context, host, http2_prior_knowledge=False):
     return tls_conn
 
 
-def _parse_url(url):
+def url_analyze(url) -> tuple:
     u = parse_url(url.strip())
     host = u.host
     port = u.port if u.port is not None else 443
-    path = u.path if u.path is not None else '/'
-    return host, port, path
+    path = u.request_uri if u.request_uri is not None else '/'
+    return u.scheme, host, port, path
 
 
-def request(method: str, url: str, headers: list[tuple[str, str]] = None, data: bytes = None,
+def request(method: str, url: str, headers: list = None, data: bytes = None,
             http2_prior_knowledge=False,
             normalize=True,
             validate=True,
             timeout: int = 10) -> HttpStruct:
-    host, port, path = _parse_url(url.strip())
+    _, host, port, path = url_analyze(url.strip())
 
     resp_seq = {}
 
@@ -155,6 +173,7 @@ def request(method: str, url: str, headers: list[tuple[str, str]] = None, data: 
     config.validate_outbound_headers = validate
     config.normalize_outbound_headers = normalize
     config.validate_inbound_headers = validate
+    config.normalize_inbound_headers = normalize
     http2_connection = H2Connection(config=config)
 
     # Step 5: Initiate the connection
@@ -162,11 +181,11 @@ def request(method: str, url: str, headers: list[tuple[str, str]] = None, data: 
 
     if data is None:
         http2_connection.send_headers(stream_id=1, headers=headers, end_stream=True)
-        resp_seq[1] = HttpStruct()
+        resp_seq[1] = HttpStruct(1)
     else:
         http2_connection.send_headers(stream_id=1, headers=headers)
         http2_connection.send_data(stream_id=1, data=data, end_stream=True)
-        resp_seq[1] = HttpStruct()
+        resp_seq[1] = HttpStruct(1)
     tls_connection.sendall(http2_connection.data_to_send())
     response_stream_ended = False
 
@@ -177,8 +196,7 @@ def request(method: str, url: str, headers: list[tuple[str, str]] = None, data: 
         # print("after receive data before")
 
         if not recv_data:
-            logging.error("%s no data receive" % url)
-            break
+            raise RuntimeError(f"{url} <StreamId: 1>: no data receive")
 
         # feed raw data into h2, and process resulting events
         events = http2_connection.receive_data(recv_data)
@@ -186,14 +204,14 @@ def request(method: str, url: str, headers: list[tuple[str, str]] = None, data: 
             # print(event)
             if isinstance(event, ResponseReceived):
                 # resp_headers = event.headers
-                resp_seq[event.stream_id].setHeaders(event.headers)
+                resp_seq[event.stream_id]._setHeaders(event.headers)
 
             elif isinstance(event, DataReceived):
                 # update flow control so the server doesn't starve us
                 http2_connection.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
                 # more response body data received
                 # resp_body += event.data
-                resp_seq[event.stream_id].setData(resp_seq[event.stream_id].getData() + event.data)
+                resp_seq[event.stream_id]._setData(resp_seq[event.stream_id].getData() + event.data)
             elif isinstance(event, StreamEnded):
                 # response body completed, let's exit the loop
                 response_stream_ended = True
@@ -208,12 +226,11 @@ def request(method: str, url: str, headers: list[tuple[str, str]] = None, data: 
                 pass
 
             elif isinstance(event, StreamReset):
-                logging.error("%s <StreamId: %d>: %s" % (url, event.stream_id, event.error_code))
+                # logging.error("%s <StreamId: %d>: %s" % (url, event.stream_id, event.error_code))
                 http2_connection.close_connection()
                 tls_connection.close()
-                return resp_seq[event.stream_id]
-                # print(event.error_code)
-                # raise RuntimeError("Stream reset: %d" % event.error_code)
+                raise RuntimeError(f"{url} <StreamId: {event.stream_id}>: StreamReset, {str(event.error_code)}")
+                # return resp_seq[event.stream_id]
 
         # send any pending data to the server
         tls_connection.sendall(http2_connection.data_to_send())
@@ -229,7 +246,7 @@ def request(method: str, url: str, headers: list[tuple[str, str]] = None, data: 
     return resp_seq[1]
 
 
-def get(url: str, headers: list[tuple[str, str]] = None, data: bytes = None,
+def get(url: str, headers: list = None, data: bytes = None,
         http2_prior_knowledge=False,
         normalize=True,
         validate=True,
@@ -238,7 +255,7 @@ def get(url: str, headers: list[tuple[str, str]] = None, data: bytes = None,
                    normalize=normalize, validate=validate, timeout=timeout)
 
 
-def post(url: str, headers: list[tuple[str, str]] = None, data: bytes = None,
+def post(url: str, headers: list = None, data: bytes = None,
          http2_prior_knowledge=False,
          normalize=True,
          validate=True,
@@ -248,9 +265,9 @@ def post(url: str, headers: list[tuple[str, str]] = None, data: bytes = None,
 
 
 class Session:
-    def __del__(self):
-        if self.__connection.fileno() != -1:
-            self.close()
+    # def __del__(self):
+    #     if self.__connection.fileno() != -1:
+    #         self.close()
 
     def __init__(self, host: str, port: int, config: h2.connection.H2Configuration = h2.connection.H2Configuration(),
                  http2_prior_knowledge: bool = False,
@@ -283,14 +300,14 @@ class Session:
         # close the socket
         self.__tls_connection.close()
 
-    def request(self, method: str, url: str, headers: list[tuple[str, str]] = None, body: bytes = None,
+    def request(self, method: str, url: str, headers: list = None, data: bytes = None,
                 timeout: int = 15) -> HttpStruct:
         self.__stream_id += 2
         if not self.__tls_connection.session:
             raise RuntimeError(
                 f"{url} <StreamId: {self.__stream_id}>: Connection closed")
         # self.__connection.settimeout(timeout) # not work
-        host, port, path = _parse_url(url.strip())
+        _, host, port, path = url_analyze(url.strip())
 
         if headers is None:
             headers = [
@@ -299,18 +316,17 @@ class Session:
                 (':authority', host),
                 (':scheme', 'https'),
             ]
-            if body is not None:
-                headers.append(("content-length", str(len(body))))
-
+            if data is not None:
+                headers.append(("content-length", str(len(data))))
         resp_seq = {}
 
-        if body is None:
+        if data is None:
             self.__http2_connection.send_headers(stream_id=self.__stream_id, headers=headers, end_stream=True)
-            resp_seq[self.__stream_id] = HttpStruct()
+            resp_seq[self.__stream_id] = HttpStruct(self.__stream_id)
         else:
             self.__http2_connection.send_headers(stream_id=self.__stream_id, headers=headers)
-            self.__http2_connection.send_data(stream_id=self.__stream_id, data=body, end_stream=True)
-            resp_seq[self.__stream_id] = HttpStruct()
+            self.__http2_connection.send_data(stream_id=self.__stream_id, data=data, end_stream=True)
+            resp_seq[self.__stream_id] = HttpStruct(self.__stream_id)
         self.__tls_connection.sendall(self.__http2_connection.data_to_send())
 
         response_stream_ended = False
@@ -318,27 +334,28 @@ class Session:
         while not response_stream_ended:
             # read raw data from the socket
             # print("before receive data")
-            data = self.__tls_connection.recv(65536 * 1024)
+            recv_data = self.__tls_connection.recv(65536 * 1024)
             # print("after receive data before")
 
-            if not data:
+            if not recv_data:
+                self.close()
                 raise RuntimeError(f"{url} <StreamId: {self.__stream_id}>: no data receive")
                 # break
 
             # feed raw data into h2, and process resulting events
-            events = self.__http2_connection.receive_data(data)
+            events = self.__http2_connection.receive_data(recv_data)
             for event in events:
                 # print(event)
                 if isinstance(event, ResponseReceived):
                     # resp_headers = event.headers
-                    resp_seq[event.stream_id].setHeaders(event.headers)
+                    resp_seq[event.stream_id]._setHeaders(event.headers)
 
                 elif isinstance(event, DataReceived):
                     # update flow control so the server doesn't starve us
                     self.__http2_connection.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
                     # more response body data received
                     # resp_body += event.data
-                    resp_seq[event.stream_id].setData(resp_seq[event.stream_id].getData() + event.data)
+                    resp_seq[event.stream_id]._setData(resp_seq[event.stream_id].getData() + event.data)
                 elif isinstance(event, StreamEnded):
                     # response body completed, let's exit the loop
                     response_stream_ended = True
@@ -353,7 +370,8 @@ class Session:
                     pass
 
                 elif isinstance(event, StreamReset):
-
+                    # print(headers, data)
+                    self.close()
                     raise RuntimeError(f"{url} <StreamId: {event.stream_id}>: StreamReset, {str(event.error_code)}")
                     # self.close()
                     # return resp_seq[event.stream_id]
@@ -366,8 +384,8 @@ class Session:
         # print(resp_body)
         return resp_seq[self.__stream_id]
 
-    def get(self, url, data: bytes = None, headers: list[tuple[str, str]] = None, timeout: int = 10):
-        return self.request("GET", url, body=data, headers=headers, timeout=timeout)
+    def get(self, url, data: bytes = None, headers: list = None, timeout: int = 10):
+        return self.request("GET", url, data=data, headers=headers, timeout=timeout)
 
-    def post(self, url, data: bytes = None, headers: list[tuple[str, str]] = None, timeout: int = 10):
-        return self.request("POST", url, body=data, headers=headers, timeout=timeout)
+    def post(self, url, data: bytes = None, headers: list = None, timeout: int = 10):
+        return self.request("POST", url, data=data, headers=headers, timeout=timeout)
