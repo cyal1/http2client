@@ -12,7 +12,7 @@ import ssl
 import h2.connection
 import h2.events
 from urllib3.util import parse_url
-from h2.connection import H2Connection,H2Stream
+from h2.connection import H2Connection, H2Stream
 from h2.events import (
     ResponseReceived, DataReceived, StreamEnded, StreamReset,
     SettingsAcknowledged,
@@ -43,6 +43,8 @@ def _new_track_content_length(self, length, end_stream):
             logging.warn(f"InvalidBodyLengthError(expected: {expected}, actual: {actual})")
             return
             # raise InvalidBodyLengthError(expected, actual)
+
+
 H2Stream._track_content_length = _new_track_content_length
 
 
@@ -56,6 +58,20 @@ class HttpStruct:
 
     def getHeaders(self):
         return self._headers
+
+    def getHeader(self, header: str):
+        for h in self._headers:
+            if h[0] == header.encode():
+                return h[1]
+        else:
+            return None
+
+    def getContentLength(self) -> int:
+        h = self.getHeader('content-length')
+        if h:
+            return int(h.decode())
+        else:
+            return self.getBodyLength()
 
     def getData(self):
         return self._data
@@ -80,7 +96,7 @@ class HttpStruct:
             return None
         return self.getHeaders()[0][1].decode()
 
-    def getContentLength(self) -> int:
+    def getBodyLength(self) -> int:
         return len(self.getData())
 
 
